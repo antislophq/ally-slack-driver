@@ -3,204 +3,277 @@
 | Ally Oauth driver
 |--------------------------------------------------------------------------
 |
-| Make sure you through the code and comments properly and make necessary
-| changes as per the requirements of your implementation.
+| Slack "Sign in with Slack" OpenID Connect driver.
 |
 */
 
-/**
-|--------------------------------------------------------------------------
- *  Search keyword "SlackDriver" and replace it with a meaningful name
-|--------------------------------------------------------------------------
- */
-
-import { Oauth2Driver } from '@adonisjs/ally'
+import { Oauth2Driver, RedirectRequest } from '@adonisjs/ally'
 import type { HttpContext } from '@adonisjs/core/http'
-import type { AllyDriverContract, AllyUserContract, ApiRequestContract } from '@adonisjs/ally/types'
+import type {
+  AllyDriverContract,
+  AllyUserContract,
+  ApiRequestContract,
+} from '@adonisjs/ally/types'
+import { randomBytes } from 'node:crypto'
 
 /**
- *
- * Access token returned by your driver implementation. An access
- * token must have "token" and "type" properties and you may
- * define additional properties (if needed)
+ * Response from 
+ * https://docs.slack.dev/reference/methods/openid.connect.token/#response
  */
-export type SlackDriverAccessToken = {
+export type SlackAccessToken = {
   token: string
   type: 'bearer'
+  id_token: string
 }
 
 /**
- * Scopes accepted by the driver implementation.
+ * Scopes accepted by the Slack OpenID Connect driver.
+ * https://slack.com/.well-known/openid-configuration
  */
-export type SlackDriverScopes = string
+export type SlackScopes = 'openid' | 'profile' | 'email'
 
 /**
- * The configuration accepted by the driver implementation.
+ * Configuration accepted by the Slack driver.
  */
 export type SlackDriverConfig = {
   clientId: string
   clientSecret: string
   callbackUrl: string
-  authorizeUrl?: string
-  accessTokenUrl?: string
-  userInfoUrl?: string
+  scopes?: SlackScopes[] // default: ['openid', 'profile', 'email']
+  team?: string
+}
+
+type AllyUser = {
+  id: string
+  nickName: string
+  name: string
+  email: string | null
+  avatarUrl: string | null
+  emailVerificationState: 'verified' | 'unverified'
+  original: SlackUser
+}
+
+type SlackUser = {
+  sub: string
+  name?: string | null
+  email?: string | null
+  email_verified?: boolean | null
+  picture?: string | null
+  'https://slack.com/user_image_512'?: string | null
+  [key: string]: unknown
+}
+
+function decodeJwtPayload(jwt: string): Record<string, unknown> {
+  const segments = jwt.split('.')
+  if (segments.length < 2 || !segments[1]) {
+    throw new Error('Invalid id_token: missing JWT payload')
+  }
+
+  try {
+    return JSON.parse(Buffer.from(segments[1], 'base64url').toString())
+  } catch {
+    throw new Error('Invalid id_token: malformed JWT payload')
+  }
+}
+
+function toAllyUser(user: SlackUser): AllyUser {
+  if (!user.sub) {
+    throw new Error('Slack OIDC claims missing user id')
+  }
+
+  return {
+    id: user.sub,
+    nickName: user.name ?? '',
+    name: user.name ?? '',
+    email: user.email ?? null,
+    emailVerificationState: user.email_verified ? 'verified' : 'unverified',
+    avatarUrl: user.picture ?? user['https://slack.com/user_image_512'] ?? null,
+    original: user,
+  } satisfies Omit<AllyUserContract<SlackAccessToken>, 'token'>
+}
+
+function toSlackUser(payload: Record<string, unknown>): SlackUser {
+  const keysToRemove = [
+    'iss',
+    'aud',
+    'exp',
+    'iat',
+    'auth_time',
+    'nonce',
+    'at_hash',
+    'ok',
+    'error',
+  ] as const
+
+  for (const key of keysToRemove) {
+    delete payload[key]
+  }
+
+  return payload as SlackUser
 }
 
 /**
- * Driver implementation. It is mostly configuration driven except the API call
- * to get user info.
+ * Driver implementation for Slack Sign in with Slack (OpenID Connect).
  */
 export class SlackDriver
-  extends Oauth2Driver<SlackDriverAccessToken, SlackDriverScopes>
-  implements AllyDriverContract<SlackDriverAccessToken, SlackDriverScopes>
-{
-  /**
-   * The URL for the redirect request. The user will be redirected on this page
-   * to authorize the request.
-   *
-   * Do not define query strings in this URL.
-   */
-  protected authorizeUrl = ''
+  extends Oauth2Driver<SlackAccessToken, SlackScopes>
+  implements AllyDriverContract<SlackAccessToken, SlackScopes> {
 
-  /**
-   * The URL to hit to exchange the authorization code for the access token
-   *
-   * Do not define query strings in this URL.
-   */
-  protected accessTokenUrl = ''
+  // https://slack.com/.well-known/openid-configuration
+  protected authorizeUrl = 'https://slack.com/openid/connect/authorize'
+  protected accessTokenUrl = 'https://slack.com/api/openid.connect.token'
+  protected userInfoUrl = 'https://slack.com/api/openid.connect.userInfo'
 
-  /**
-   * The URL to hit to get the user details
-   *
-   * Do not define query strings in this URL.
-   */
-  protected userInfoUrl = ''
-
-  /**
-   * The param name for the authorization code. Read the documentation of your oauth
-   * provider and update the param name to match the query string field name in
-   * which the oauth provider sends the authorization_code post redirect.
-   */
   protected codeParamName = 'code'
-
-  /**
-   * The param name for the error. Read the documentation of your oauth provider and update
-   * the param name to match the query string field name in which the oauth provider sends
-   * the error post redirect
-   */
   protected errorParamName = 'error'
 
-  /**
-   * Cookie name for storing the CSRF token. Make sure it is always unique. So a better
-   * approach is to prefix the oauth provider name to `oauth_state` value. For example:
-   * For example: "facebook_oauth_state"
-   */
-  protected stateCookieName = 'SlackDriver_oauth_state'
-
-  /**
-   * Parameter name to be used for sending and receiving the state from.
-   * Read the documentation of your oauth provider and update the param
-   * name to match the query string used by the provider for exchanging
-   * the state.
-   */
+  protected stateCookieName = 'slack_oauth_state'
   protected stateParamName = 'state'
-
-  /**
-   * Parameter name for sending the scopes to the oauth provider.
-   */
   protected scopeParamName = 'scope'
-
-  /**
-   * The separator indentifier for defining multiple scopes
-   */
   protected scopesSeparator = ' '
+
+  protected nonceCookieName = 'slack_oauth_nonce'
+  protected nonceCookieValue?: string
 
   constructor(
     ctx: HttpContext,
     public config: SlackDriverConfig
   ) {
     super(ctx, config)
-
-    /**
-     * Extremely important to call the following method to clear the
-     * state set by the redirect request.
-     *
-     * DO NOT REMOVE THE FOLLOWING LINE
-     */
     this.loadState()
+    this.nonceCookieValue = this.ctx.request.encryptedCookie(this.nonceCookieName)
+    this.ctx.response.clearCookie(this.nonceCookieName)
   }
 
   /**
-   * Optionally configure the authorization redirect request. The actual request
-   * is made by the base implementation of "Oauth2" driver and this is a
-   * hook to pre-configure the request.
+   * Configures the authorization redirect for Slack OpenID Connect.
    */
-  // protected configureRedirectRequest(request: RedirectRequest<SlackDriverScopes>) {}
+  protected configureRedirectRequest(request: RedirectRequest<SlackScopes>) {
+    const scopes = this.config.scopes ?? ['openid', 'profile', 'email']
 
-  /**
-   * Optionally configure the access token request. The actual request is made by
-   * the base implementation of "Oauth2" driver and this is a hook to pre-configure
-   * the request
-   */
-  // protected configureAccessTokenRequest(request: ApiRequest) {}
+    if (!scopes.includes('openid')) {
+      throw new Error('Sign in with Slack requires the openid scope')
+    }
 
-  /**
-   * Update the implementation to tell if the error received during redirect
-   * means "ACCESS DENIED".
-   */
-  accessDenied() {
-    return this.ctx.request.input('error') === 'user_denied'
+    request.scopes(scopes)
+    request.param('response_type', 'code')
+
+    const nonce = randomBytes(16).toString('hex')
+    this.ctx.response.encryptedCookie(this.nonceCookieName, nonce, {
+      sameSite: false,
+      httpOnly: true,
+    })
+    request.param('nonce', nonce)
+
+    if (this.config.team) {
+      request.param('team', this.config.team)
+    }
   }
 
   /**
-   * Get the user details by query the provider API. This method must return
-   * the access token and the user details both. Checkout the google
-   * implementation for same.
-   *
-   * https://github.com/adonisjs/ally/blob/develop/src/Drivers/Google/index.ts#L191-L199
+   * Returns an HTTP client with the Bearer authorization header set.
    */
-  async user(
-    callback?: (request: ApiRequestContract) => void
-  ): Promise<AllyUserContract<SlackDriverAccessToken>> {
-    const accessToken = await this.accessToken()
-    const request = this.httpClient(this.config.userInfoUrl || this.userInfoUrl)
+  protected getAuthenticatedRequest(url: string, token: string) {
+    const request = this.httpClient(url)
+    request.header('Authorization', `Bearer ${token}`)
+    request.header('Accept', 'application/json')
+    request.parseAs('json')
+    return request
+  }
 
-    /**
-     * Allow end user to configure the request. This should be called after your custom
-     * configuration, so that the user can override them (if needed)
-     */
+  protected decodeIdToken(idToken: string): SlackUser {
+    const payload = decodeJwtPayload(idToken)
+
+    if (payload.nonce !== this.nonceCookieValue) {
+      throw new Error('OpenID Connect nonce mismatch')
+    }
+
+    if (payload.aud !== this.config.clientId) {
+      throw new Error('OpenID Connect audience mismatch')
+    }
+
+    if (typeof payload.sub !== 'string' || !payload.sub) {
+      throw new Error('OpenID Connect id_token missing sub')
+    }
+
+    return toSlackUser(payload)
+  }
+
+  /**
+   * Fetches user info from the Slack OpenID Connect userInfo endpoint.
+   */
+  protected async getUserInfo(token: string, callback?: (request: ApiRequestContract) => void) {
+    const request = this.getAuthenticatedRequest(this.userInfoUrl, token)
+
     if (typeof callback === 'function') {
       callback(request)
     }
 
-    /**
-     * Write your implementation details here.
-     */
+    const body = (await request.post()) as Record<string, unknown>
+
+    if (body.ok === false) {
+      throw new Error(
+        typeof body.error === 'string' ? body.error : 'Slack userInfo request failed'
+      )
+    }
+
+    return toAllyUser(toSlackUser(body))
   }
 
+  /**
+   * Exchanges the authorization code for access_token and id_token that decodes to a SlackUser.
+   */
+  async accessToken(
+    callback?: (request: ApiRequestContract) => void
+  ): Promise<SlackAccessToken> {
+    return await super.accessToken(callback)
+  }
+
+  /**
+   * Returns true when the user denied access during the OAuth redirect.
+   */
+  accessDenied() {
+    const error = this.getError()
+    if (!error) {
+      return false
+    }
+    return error === 'access_denied'
+  }
+
+  /**
+   * Gets the authenticated user and access token after the OAuth callback.
+   */
+  async user(
+    callback?: (request: ApiRequestContract) => void
+  ): Promise<AllyUserContract<SlackAccessToken>> {
+    const accessToken = await this.accessToken(callback)
+    const slackUser = this.decodeIdToken(accessToken.id_token)
+    const user = toAllyUser(slackUser)
+
+    return {
+      ...user,
+      token: accessToken,
+    }
+  }
+
+  /**
+   * Gets the authenticated user from an existing access token.
+   */
   async userFromToken(
     accessToken: string,
     callback?: (request: ApiRequestContract) => void
   ): Promise<AllyUserContract<{ token: string; type: 'bearer' }>> {
-    const request = this.httpClient(this.config.userInfoUrl || this.userInfoUrl)
+    const user = await this.getUserInfo(accessToken, callback)
 
-    /**
-     * Allow end user to configure the request. This should be called after your custom
-     * configuration, so that the user can override them (if needed)
-     */
-    if (typeof callback === 'function') {
-      callback(request)
+    return {
+      ...user,
+      token: { token: accessToken, type: 'bearer' },
     }
-
-    /**
-     * Write your implementation details here
-     */
   }
 }
 
 /**
- * The factory function to reference the driver implementation
- * inside the "config/ally.ts" file.
+ * Factory function to reference the driver inside config/ally.ts.
  */
 export function SlackDriverService(config: SlackDriverConfig): (ctx: HttpContext) => SlackDriver {
   return (ctx) => new SlackDriver(ctx, config)

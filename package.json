@@ -2,7 +2,7 @@
   "name": "@antislop/ally-slack",
   "description": "A Slack driver for AdonisJS Ally",
   "version": "0.1.0",
-  "main": "index.js",
+  "main": "build/index.js",
   "type": "module",
   "files": [
     "build/index.js",
@@ -27,10 +27,10 @@
     "typescript": "^5.4.5"
   },
   "peerDependencies": {
-    "@adonisjs/ally": "^5.0.0-7",
-    "@adonisjs/core": "^6.1.5-32"
+    "@adonisjs/ally": "^6.3.0",
+    "@adonisjs/core": "^7.3.0"
   },
-  "author": "",
+  "author": "@antislophq",
   "license": "MIT",
   "keywords": [
     "social-auth",
@@ -42,5 +42,8 @@
     "extends": "@adonisjs/eslint-config/package"
   },
   "prettier": "@adonisjs/prettier-config",
-  "homepage": "https://github.com/antislophq/ally-slack-driver"
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/antislophq/ally-slack-driver.git"
+  }
 }
