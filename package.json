@@ -42,8 +42,5 @@
     "extends": "@adonisjs/eslint-config/package"
   },
   "prettier": "@adonisjs/prettier-config",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/antislophq/ally-slack-driver.git"
-  }
+  "homepage": "https://github.com/antislophq/ally-slack-driver"
 }
