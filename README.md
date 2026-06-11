@@ -41,7 +41,7 @@ Slack OpenID Connect supports:
 | `profile` | (Optional) Name and profile images |
 | `email`   | (Optional) Email address |
 
-If left unspecified, the default scopes incluse all of the above.  
+If left unspecified, the default scopes include all of the above.  
 
 ## License
 
